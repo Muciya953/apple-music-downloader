@@ -1,0 +1,138 @@
+name: Download Apple Music
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: One Apple Music URL per line
+        required: true
+        type: string
+        default: |
+          https://music.apple.com/cn/album/savage-daughter/1680492302?i=1680492303
+          https://music.apple.com/cn/album/%E7%A5%9E%E5%A5%87/255920420?i=255920667
+          https://music.apple.com/cn/album/nate-growing-up-from-euphoria-season-1-soundtrack/1481092579?i=1481092685
+      quality:
+        description: Download quality
+        required: true
+        type: choice
+        default: alac
+        options:
+          - alac
+          - atmos
+          - aac
+      convert_to:
+        description: Optional post-download format
+        required: true
+        type: choice
+        default: original
+        options:
+          - original
+          - flac
+          - mp3
+          - opus
+          - wav
+
+permissions:
+  contents: read
+
+concurrency:
+  group: amdl-download-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.1'
+          cache: true
+
+      - name: Build downloader
+        run: go build -trimpath -o "$RUNNER_TEMP/amdl" .
+
+      - name: Write runtime config
+        env:
+          AMDL_LITE_SERVER: ${{ secrets.AMDL_LITE_SERVER }}
+          AMDL_MEDIA_USER_TOKEN: ${{ secrets.AMDL_MEDIA_USER_TOKEN }}
+          AMDL_AUTHORIZATION_TOKEN: ${{ secrets.AMDL_AUTHORIZATION_TOKEN }}
+          AMDL_PROXY: ${{ secrets.AMDL_PROXY }}
+          CONVERT_TO: ${{ inputs.convert_to }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${AMDL_LITE_SERVER:-}" ]]; then
+            echo "::error title=Missing AMDL_LITE_SERVER::Set the AMDL_LITE_SERVER repository secret to a public wrapper-lite URL reachable from GitHub-hosted runners."
+            exit 1
+          fi
+
+          python3 - "$PWD/config.yaml" <<'PY'
+          import json
+          import os
+          import sys
+
+          def value(name):
+              return json.dumps(os.environ.get(name, ""), ensure_ascii=False)
+
+          convert_to = os.environ["CONVERT_TO"]
+          converted = "false" if convert_to == "original" else "true"
+          config = f"""general:
+            lite-server: {value("AMDL_LITE_SERVER")}
+            media-user-token: {value("AMDL_MEDIA_USER_TOKEN")}
+            authorization-token: {value("AMDL_AUTHORIZATION_TOKEN")}
+            proxy: {value("AMDL_PROXY")}
+            exit-on-error: true
+
+          paths:
+            alac: "artifacts/AM-Lossless"
+            atmos: "artifacts/AM-Atmos"
+            aac: "artifacts/AM-AAC"
+
+          convert:
+            after-download: {converted}
+            format: {value(convert_to if convert_to != "original" else "flac")}
+            keep-original: true
+          """
+          with open(sys.argv[1], "w", encoding="utf-8") as handle:
+              handle.write(config)
+          PY
+
+      - name: Download tracks
+        env:
+          INPUT_URLS: ${{ inputs.urls }}
+          QUALITY: ${{ inputs.quality }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          failed=0
+
+          while IFS= read -r url; do
+            url="${url//$'\r'/}"
+            [[ -z "${url//[[:space:]]/}" ]] && continue
+            args=(--config "$PWD/config.yaml" --json)
+            case "$QUALITY" in
+              alac) ;;
+              atmos) args+=(--atmos) ;;
+              aac) args+=(--aac) ;;
+              *) echo "::error::Unsupported quality: $QUALITY"; exit 1 ;;
+            esac
+            echo "Downloading: $url"
+            "$RUNNER_TEMP/amdl" "${args[@]}" "$url" || failed=1
+          done <<< "$INPUT_URLS"
+
+          find artifacts -type f -maxdepth 4 -print0 | xargs -0 -r ls -lh
+          exit "$failed"
+
+      - name: Upload downloaded media
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-music-${{ github.run_number }}
+          path: artifacts
+          if-no-files-found: warn
+          retention-days: 7
