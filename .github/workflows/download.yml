@@ -125,8 +125,18 @@ jobs:
             echo "Enter the wrapper key from your local key file, then sign in with Apple ID and complete 2FA."
             echo "The public URL closes automatically after login is detected."
           } >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$public_url" > "$runtime/login-url.txt"
           echo "Open the job summary for the temporary login URL."
           echo "AMDL_LITE_SERVER=http://127.0.0.1:8080" >> "$GITHUB_ENV"
+
+      - name: Publish temporary login URL
+        if: inputs.wrapper_mode == 'temporary'
+        uses: actions/upload-artifact@v4
+        with:
+          name: amdl-login-url
+          path: ${{ runner.temp }}/amdl-runtime/login-url.txt
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Wait for Apple Music login
         if: inputs.wrapper_mode == 'temporary'
