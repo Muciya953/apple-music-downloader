@@ -60,6 +60,26 @@ func TestStatus(t *testing.T) {
 	}
 }
 
+func TestWrapperKeyHeader(t *testing.T) {
+	t.Setenv("AMDL_WRAPPER_KEY", "test-wrapper-key")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-wrapper-key" {
+			http.Error(w, "missing wrapper key", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(Response[StatusData]{
+			Code: 0,
+			Msg:  "ok",
+			Data: StatusData{Regions: []string{"cn"}},
+		})
+	}))
+	defer server.Close()
+
+	if _, err := GetStatus(server.URL); err != nil {
+		t.Fatalf("GetStatus() error = %v", err)
+	}
+}
+
 func TestM3U8(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/m3u8" || r.URL.Query().Get("adamId") != "999" {

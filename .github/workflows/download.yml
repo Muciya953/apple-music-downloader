@@ -20,6 +20,14 @@ on:
           - alac
           - atmos
           - aac
+      wrapper_mode:
+        description: Wrapper connection
+        required: true
+        type: choice
+        default: temporary
+        options:
+          - temporary
+          - existing
       convert_to:
         description: Optional post-download format
         required: true
@@ -42,7 +50,7 @@ concurrency:
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
 
     steps:
       - name: Checkout
@@ -51,11 +59,105 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23.1'
+          go-version: '1.25.x'
           cache: true
 
       - name: Build downloader
         run: go build -trimpath -o "$RUNNER_TEMP/amdl" .
+
+      - name: Build temporary wrapper manager
+        if: inputs.wrapper_mode == 'temporary'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch amdl https://github.com/AMDL-Web/wrapper.git "$RUNNER_TEMP/wrapper-src"
+          cd "$RUNNER_TEMP/wrapper-src/manager"
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/wrapper-manager" .
+
+      - name: Start temporary wrapper and public login gate
+        if: inputs.wrapper_mode == 'temporary'
+        env:
+          API_KEY: ${{ secrets.AMDL_WRAPPER_KEY }}
+          AMDL_PROXY: ${{ secrets.AMDL_PROXY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${API_KEY:-}" || ${#API_KEY} -lt 32 ]]; then
+            echo "::error title=Missing AMDL_WRAPPER_KEY::Set a random repository secret of at least 32 characters."
+            exit 1
+          fi
+
+          runtime="$RUNNER_TEMP/amdl-runtime"
+          mkdir -p "$runtime"
+          cd "$runtime"
+          proxy_args=()
+          if [[ -n "${AMDL_PROXY:-}" ]]; then
+            proxy_args=(-proxy "$AMDL_PROXY")
+          fi
+          nohup sudo --preserve-env=API_KEY "$RUNNER_TEMP/wrapper-manager" \
+            -host 127.0.0.1 -port 8080 -launcher root "${proxy_args[@]}" \
+            > wrapper-manager.log 2>&1 &
+          echo $! > wrapper-manager.pid
+
+          curl -fL --retry 3 --retry-delay 2 \
+            -o "$RUNNER_TEMP/cloudflared" \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x "$RUNNER_TEMP/cloudflared"
+          nohup "$RUNNER_TEMP/cloudflared" tunnel --no-autoupdate \
+            --url http://127.0.0.1:8080 > cloudflared.log 2>&1 &
+          echo $! > cloudflared.pid
+
+          public_url=""
+          for _ in $(seq 1 90); do
+            public_url=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' cloudflared.log | head -n 1 || true)
+            [[ -n "$public_url" ]] && break
+            sleep 1
+          done
+          if [[ -z "$public_url" ]]; then
+            echo "::error::Cloudflare Tunnel did not provide a public URL"
+            tail -n 100 cloudflared.log
+            exit 1
+          fi
+
+          {
+            echo "### Apple Music login"
+            echo
+            echo "Open: $public_url"
+            echo
+            echo "Enter the wrapper key from your local key file, then sign in with Apple ID and complete 2FA."
+            echo "The public URL closes automatically after login is detected."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Open the job summary for the temporary login URL."
+          echo "AMDL_LITE_SERVER=http://127.0.0.1:8080" >> "$GITHUB_ENV"
+
+      - name: Wait for Apple Music login
+        if: inputs.wrapper_mode == 'temporary'
+        env:
+          API_KEY: ${{ secrets.AMDL_WRAPPER_KEY }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 360); do
+            if response=$(curl -fsS -H "Authorization: Bearer $API_KEY" http://127.0.0.1:8080/status 2>/dev/null) &&
+               jq -e '.code == 0 and ((.data.regions // []) | length > 0)' >/dev/null <<< "$response"; then
+              echo "Apple Music account is ready."
+              exit 0
+            fi
+            if (( attempt % 12 == 0 )); then
+              echo "Waiting for login... $((attempt / 12)) minute(s)"
+            fi
+            sleep 5
+          done
+          echo "::error::Timed out waiting for Apple Music login"
+          tail -n 120 "$RUNNER_TEMP/amdl-runtime/wrapper-manager.log" || true
+          exit 1
+
+      - name: Close public login gate
+        if: always() && inputs.wrapper_mode == 'temporary'
+        run: |
+          set -euo pipefail
+          runtime="$RUNNER_TEMP/amdl-runtime"
+          if [[ -f "$runtime/cloudflared.pid" ]]; then
+            kill "$(cat "$runtime/cloudflared.pid")" 2>/dev/null || true
+          fi
+          echo "Public login URL is closed."
 
       - name: Write runtime config
         env:
@@ -66,12 +168,15 @@ jobs:
           CONVERT_TO: ${{ inputs.convert_to }}
         run: |
           set -euo pipefail
-          if [[ -z "${AMDL_LITE_SERVER:-}" ]]; then
+          if [[ "${{ inputs.wrapper_mode }}" == "existing" && -z "${AMDL_LITE_SERVER:-}" ]]; then
             echo "::error title=Missing AMDL_LITE_SERVER::Set the AMDL_LITE_SERVER repository secret to a public wrapper-lite URL reachable from GitHub-hosted runners."
             exit 1
           fi
+          if [[ "${{ inputs.wrapper_mode }}" == "temporary" ]]; then
+            AMDL_LITE_SERVER="http://127.0.0.1:8080"
+          fi
 
-          python3 - "$PWD/config.yaml" <<'PY'
+          python3 - "$PWD/config.yaml" "$AMDL_LITE_SERVER" <<'PY'
           import json
           import os
           import sys
@@ -82,7 +187,7 @@ jobs:
           convert_to = os.environ["CONVERT_TO"]
           converted = "false" if convert_to == "original" else "true"
           config = f"""general:
-            lite-server: {value("AMDL_LITE_SERVER")}
+            lite-server: {json.dumps(sys.argv[2], ensure_ascii=False)}
             media-user-token: {value("AMDL_MEDIA_USER_TOKEN")}
             authorization-token: {value("AMDL_AUTHORIZATION_TOKEN")}
             proxy: {value("AMDL_PROXY")}
@@ -106,6 +211,7 @@ jobs:
         env:
           INPUT_URLS: ${{ inputs.urls }}
           QUALITY: ${{ inputs.quality }}
+          AMDL_WRAPPER_KEY: ${{ secrets.AMDL_WRAPPER_KEY }}
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -136,3 +242,12 @@ jobs:
           path: artifacts
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Stop temporary wrapper
+        if: always() && inputs.wrapper_mode == 'temporary'
+        run: |
+          set -euo pipefail
+          runtime="$RUNNER_TEMP/amdl-runtime"
+          if [[ -f "$runtime/wrapper-manager.pid" ]]; then
+            sudo kill "$(cat "$runtime/wrapper-manager.pid")" 2>/dev/null || true
+          fi

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 
 	"amdl/internal/download"
@@ -46,6 +47,9 @@ func (c *Client) get(endpoint string) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
+	}
+	if key := strings.TrimSpace(os.Getenv("AMDL_WRAPPER_KEY")); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
 	}
 
 	client := c.HTTPClient
@@ -112,6 +116,9 @@ func (c *Client) post(endpoint string, reqBody any) ([]byte, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if key := strings.TrimSpace(os.Getenv("AMDL_WRAPPER_KEY")); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
 
 	client := c.HTTPClient
 	if client == nil {
